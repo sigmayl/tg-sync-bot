@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.ruff_cache/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 运行时数据：session 等同于账号凭证，绝不能提交
+*.session
+*.session-journal
+.env
+state/
+downloads/

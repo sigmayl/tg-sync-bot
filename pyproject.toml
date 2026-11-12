@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tg-sync"
+version = "0.1.0"
+description = "Telegram 机器人：/sync <url> 下载媒体并通过 MTProto 回传"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "telethon>=1.36",
+    "yt-dlp>=2024.8.6",
+]
+
+[project.optional-dependencies]
+socks = ["python-socks[asyncio]>=2.4"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+tg-sync = "tg_sync.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "BLE"]
+ignore = [
+    "BLE001", # 网络/第三方库边界需要兜底捕获，避免一条命令拖垮整个 worker
+    "E501",   # 长行交给 formatter
+    "RUF001", # 中文全角标点不是笔误
+    "RUF002",
+    "RUF003",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["ignore::DeprecationWarning"]

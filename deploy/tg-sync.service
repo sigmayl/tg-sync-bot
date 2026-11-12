@@ -1,0 +1,17 @@
+[Unit]
+Description=tg-sync (Telegram bot media sync)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成实际路径与运行用户
+User=seey6
+WorkingDirectory=/home/seey6/Projects/tg-sync-tool
+ExecStart=/home/seey6/Projects/tg-sync-tool/.venv/bin/tg-sync run
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
