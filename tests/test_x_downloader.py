@@ -54,7 +54,7 @@ async def test_photo_tweet_downloads_original(tmp_path: Path, monkeypatch) -> No
     )
     monkeypatch.setattr(x_module, "_download_url", fake_download)
     monkeypatch.setattr(
-        downloader, "_run_ytdlp", lambda url, workdir: pytest.fail("不应调用 yt-dlp")
+        downloader, "_run_ytdlp", lambda url, workdir, expected_id=None: pytest.fail("不应调用 yt-dlp")
     )
 
     items = await downloader.download(
@@ -72,7 +72,7 @@ async def test_video_tweet_downloads_best_mp4(tmp_path: Path, monkeypatch) -> No
     fake, calls = recording_download()
     monkeypatch.setattr(x_module, "_download_url", fake)
     monkeypatch.setattr(
-        downloader, "_run_ytdlp", lambda url, workdir: pytest.fail("不应调用 yt-dlp")
+        downloader, "_run_ytdlp", lambda url, workdir, expected_id=None: pytest.fail("不应调用 yt-dlp")
     )
 
     items = await downloader.download(
@@ -93,7 +93,7 @@ async def test_video_falls_back_to_ytdlp(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(x_module, "_download_url", broken)
     produced = tmp_path / "001-abc.mp4"
     produced.write_bytes(b"video")
-    monkeypatch.setattr(downloader, "_run_ytdlp", lambda url, workdir: [produced])
+    monkeypatch.setattr(downloader, "_run_ytdlp", lambda url, workdir, expected_id=None: [produced])
 
     items = await downloader.download(
         parse_link("https://x.com/NASA/status/123"), tmp_path
@@ -143,7 +143,7 @@ async def test_all_variants_too_big_falls_back_to_ytdlp(
     monkeypatch.setattr(x_module, "_content_length", lambda url: 5000)
     produced = tmp_path / "001-abc.mp4"
     produced.write_bytes(b"video")
-    monkeypatch.setattr(downloader, "_run_ytdlp", lambda url, workdir: [produced])
+    monkeypatch.setattr(downloader, "_run_ytdlp", lambda url, workdir, expected_id=None: [produced])
 
     items = await downloader.download(
         parse_link("https://x.com/NASA/status/123"), tmp_path
@@ -155,7 +155,7 @@ async def test_all_variants_too_big_falls_back_to_ytdlp(
 async def test_text_only_tweet_raises(tmp_path: Path, monkeypatch) -> None:
     downloader = XDownloader()
     monkeypatch.setattr(downloader, "_fetch_tweet", lambda tweet_id: tweet_with())
-    monkeypatch.setattr(downloader, "_run_ytdlp", lambda url, workdir: [])
+    monkeypatch.setattr(downloader, "_run_ytdlp", lambda url, workdir, expected_id=None: [])
 
     with pytest.raises(DownloadError, match="不包含可下载的媒体"):
         await downloader.download(parse_link("https://x.com/NASA/status/123"), tmp_path)
@@ -164,7 +164,7 @@ async def test_text_only_tweet_raises(tmp_path: Path, monkeypatch) -> None:
 async def test_unreadable_tweet_hints_cookies(tmp_path: Path, monkeypatch) -> None:
     downloader = XDownloader()
     monkeypatch.setattr(downloader, "_fetch_tweet", lambda tweet_id: None)
-    monkeypatch.setattr(downloader, "_run_ytdlp", lambda url, workdir: [])
+    monkeypatch.setattr(downloader, "_run_ytdlp", lambda url, workdir, expected_id=None: [])
 
     with pytest.raises(DownloadError, match="TG_YTDLP_COOKIES"):
         await downloader.download(parse_link("https://x.com/NASA/status/123"), tmp_path)
@@ -303,3 +303,84 @@ def test_download_url_gives_up_after_retries(tmp_path: Path, monkeypatch) -> Non
 
     with pytest.raises(DownloadError, match="多次停滞"):
         x_module._download_url("https://v/x.mp4", tmp_path / "x.mp4")
+
+
+def test_ytdlp_mismatched_id_is_discarded(tmp_path: Path, monkeypatch) -> None:
+    """yt-dlp 跳到同账号另一条推文时，必须丢弃文件而不是当成结果。"""
+    downloader = XDownloader()
+    stray = tmp_path / "001-999.mp4"
+    stray.write_bytes(b"wrong")
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def extract_info(self, url, download=True):
+            return {"id": "999", "filepath": str(stray), "_type": "video"}
+
+    import yt_dlp
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+    paths = downloader._run_ytdlp(
+        "https://x.com/a/status/123", tmp_path, expected_id="123"
+    )
+    assert paths == []
+    assert not stray.exists()
+
+
+def test_ytdlp_matching_id_is_kept(tmp_path: Path, monkeypatch) -> None:
+    downloader = XDownloader()
+    good = tmp_path / "001-123.mp4"
+    good.write_bytes(b"ok")
+
+    class FakeYDL:
+        def __init__(self, options):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def extract_info(self, url, download=True):
+            return {"id": "123", "filepath": str(good), "_type": "video"}
+
+    import yt_dlp
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+    paths = downloader._run_ytdlp(
+        "https://x.com/a/status/123", tmp_path, expected_id="123"
+    )
+    assert paths == [good]
+
+
+def test_sensitive_tweet_falls_back_to_logged_in_graphql(tmp_path: Path, monkeypatch) -> None:
+    """syndication 返回空（敏感内容）时，有 cookies 应改走登录态 GraphQL。"""
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".x.com\tTRUE\t/\tTRUE\t1999999999\tauth_token\tTOKEN\n"
+        ".x.com\tTRUE\t/\tTRUE\t1999999999\tct0\tCSRF\n",
+        encoding="utf-8",
+    )
+    downloader = XDownloader(cookies=cookies, max_file_size=0)
+
+    monkeypatch.setattr(downloader, "_fetch_tweet", lambda tweet_id: None)
+    monkeypatch.setattr(
+        downloader,
+        "_fetch_tweet_graphql",
+        lambda tweet_id: tweet_with(video(), text="sensitive"),
+    )
+    monkeypatch.setattr(x_module, "_download_url", fake_download)
+
+    link = parse_link("https://x.com/a/status/2120795685943644208")
+    items = __import__("asyncio").run(downloader.download(link, tmp_path))
+    assert len(items) == 1
+    assert items[0].path.name == "2120795685943644208_01.mp4"

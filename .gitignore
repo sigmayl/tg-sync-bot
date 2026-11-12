@@ -13,3 +13,7 @@ dist/
 .env
 state/
 downloads/
+
+# yt-dlp cookies（含 auth_token，等同账号凭证）
+cookies.txt
+*.cookies

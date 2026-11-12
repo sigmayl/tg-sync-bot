@@ -16,14 +16,16 @@ X 的媒体有两种来源，各有短板，所以这里做双通道：
 from __future__ import annotations
 
 import asyncio
+import http.cookiejar
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from ..links import Link
 from ..models import MediaItem
@@ -37,6 +39,11 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+# 网页端公开的 Bearer token（写死在前端 JS 里，非用户凭据）
+WEB_BEARER = (
+    "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
+GRAPHQL_ORIGIN = "https://x.com"
 _HTTP_TIMEOUT = 60
 _SKIP_SUFFIXES = {".part", ".ytdl", ".json", ".temp"}
 
@@ -67,6 +74,7 @@ class XDownloader:
         self.cookies_from_browser = cookies_from_browser
         self.proxy = proxy
         self.max_file_size = max_file_size
+        self._query_id: str | None = None
 
     async def download(self, link: Link, workdir: Path) -> list[MediaItem]:
         if link.tweet_id is None:
@@ -75,6 +83,15 @@ class XDownloader:
         tweet = await asyncio.to_thread(self._fetch_tweet, link.tweet_id)
         media: list[dict] = list((tweet or {}).get("mediaDetails") or [])
         title = (tweet or {}).get("text") or None
+
+        # syndication 是游客通道，对敏感/成人内容一律返回 TweetTombstone。
+        # 有 cookies 时改用登录态 GraphQL 再取一次，避免把「需要登录」误判成「已删除」。
+        if not media and self.cookies:
+            logged_in = await asyncio.to_thread(self._fetch_tweet_graphql, link.tweet_id)
+            if logged_in is not None:
+                tweet = logged_in
+                media = list(logged_in.get("mediaDetails") or [])
+                title = logged_in.get("text") or title
 
         # 保留媒体在推文中的顺序，用序号命名，避免多个视频/图片互相覆盖
         photos = [
@@ -120,6 +137,163 @@ class XDownloader:
             log.info("推文 %s 无公开数据（可能已删除或受保护）", tweet_id)
             return None
         return payload
+
+    # ------------------------------------------------------- 登录态 GraphQL
+
+    def _load_cookies(self) -> dict[str, str]:
+        """从 Netscape cookies 文件里取出 auth_token / ct0。"""
+        if not self.cookies:
+            return {}
+        try:
+            jar = http.cookiejar.MozillaCookieJar(str(self.cookies))
+            jar.load(ignore_discard=True, ignore_expires=True)
+        except (OSError, http.cookiejar.LoadError) as exc:
+            log.warning("读取 cookies 失败 %s：%s", self.cookies, exc)
+            return {}
+        return {cookie.name: cookie.value for cookie in jar}
+
+    def _fetch_tweet_graphql(self, tweet_id: int) -> dict | None:
+        """用登录态调 TweetDetail，取回 syndication 看不到的推文（敏感内容等）。
+
+        返回与 syndication 兼容的字典（mediaDetails / text），失败返回 None。
+        """
+        cookies = self._load_cookies()
+        auth_token = cookies.get("auth_token")
+        ct0 = cookies.get("ct0")
+        if not auth_token or not ct0:
+            log.info("cookies 缺少 auth_token / ct0，跳过登录态读取")
+            return None
+
+        query_id = self._tweet_detail_query_id()
+        if query_id is None:
+            return None
+
+        variables = {
+            "focalTweetId": str(tweet_id),
+            "with_rux_injections": False,
+            "includePromotedContent": True,
+            "withCommunity": True,
+            "withQuickPromoteEligibilityTweetFields": True,
+            "withBirdwatchNotes": True,
+            "withVoice": True,
+            "withV2Timeline": True,
+        }
+        features = {
+            "rweb_video_screen_enabled": False,
+            "profile_label_improvements_pcf_label_in_post_enabled": True,
+            "rweb_tipjar_consumption_enabled": True,
+            "verified_phone_label_enabled": False,
+            "creator_subscriptions_tweet_preview_api_enabled": True,
+            "responsive_web_graphql_timeline_navigation_enabled": True,
+            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+            "premium_content_api_read_enabled": False,
+            "communities_web_enable_tweet_community_results_fetch": True,
+            "c9s_tweet_anatomy_moderator_badge_enabled": True,
+            "articles_preview_enabled": True,
+            "responsive_web_edit_tweet_api_enabled": True,
+            "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+            "view_counts_everywhere_api_enabled": True,
+            "longform_notetweets_consumption_enabled": True,
+            "responsive_web_twitter_article_tweet_consumption_enabled": True,
+            "tweet_awards_web_tipping_enabled": False,
+            "freedom_of_speech_not_reach_fetch_enabled": True,
+            "standardized_nudges_misinfo": True,
+            "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+            "longform_notetweets_rich_text_read_enabled": True,
+            "longform_notetweets_inline_media_enabled": True,
+            "responsive_web_enhance_cards_enabled": False,
+        }
+        url = (
+            f"{GRAPHQL_ORIGIN}/i/api/graphql/{query_id}/TweetDetail"
+            f"?variables={quote(json.dumps(variables))}"
+            f"&features={quote(json.dumps(features))}"
+        )
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Authorization": f"Bearer {WEB_BEARER}",
+            "Cookie": f"auth_token={auth_token}; ct0={ct0}",
+            "x-csrf-token": ct0,
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-active-user": "yes",
+            "Accept": "*/*",
+            "Referer": f"https://x.com/i/status/{tweet_id}",
+            "content-type": "application/json",
+        }
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            log.warning("登录态读取推文 %s 失败：%s", tweet_id, exc)
+            return None
+
+        node = _find_tweet_node(payload, str(tweet_id))
+        if node is None:
+            log.info("登录态也读不到推文 %s（可能已删除）", tweet_id)
+            return None
+
+        legacy = node.get("legacy") or {}
+        entities = legacy.get("extended_entities") or legacy.get("entities") or {}
+        media_details: list[dict] = []
+        for item in entities.get("media") or []:
+            detail: dict = {
+                "type": item.get("type"),
+                "media_url_https": item.get("media_url_https"),
+                "video_info": item.get("video_info"),
+            }
+            media_details.append(detail)
+        return {"mediaDetails": media_details, "text": legacy.get("full_text") or None}
+
+    def _tweet_detail_query_id(self) -> str | None:
+        """从网页 bundle 里抓 TweetDetail 的 queryId（X 会不定期更换）。"""
+        if self._query_id is not None:
+            return self._query_id or None
+        self._query_id = ""
+
+        cookies = self._load_cookies()
+        auth_token = cookies.get("auth_token")
+        ct0 = cookies.get("ct0")
+        cookie_header = f"auth_token={auth_token}; ct0={ct0}" if auth_token and ct0 else ""
+
+        page = ""
+        # 带 cookie 的推文页才会下发 bundle 引用；用公开推文做探针，不受目标推文状态影响
+        for probe in ("https://x.com/NASA/status/2119083432835764635", "https://x.com/NASA"):
+            headers = {"User-Agent": USER_AGENT, "Accept": "text/html"}
+            if cookie_header:
+                headers["Cookie"] = cookie_header
+            try:
+                request = urllib.request.Request(probe, headers=headers)
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    page = response.read().decode("utf-8", "replace")
+                if page:
+                    break
+            except (urllib.error.URLError, OSError) as exc:
+                log.debug("探测 %s 失败：%s", probe, exc)
+        if not page:
+            log.warning("读取 X 页面失败，无法获取 TweetDetail queryId")
+            return None
+
+        bundles = sorted(
+            set(re.findall(r"https://abs\.twimg\.com/responsive-web/client-web[^\"'\\ ]+?\.js", page))
+        )
+        source = page
+        for bundle in bundles:
+            try:
+                req = urllib.request.Request(bundle, headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(req, timeout=20) as response:
+                    source += response.read().decode("utf-8", "replace")
+            except (urllib.error.URLError, OSError):
+                continue
+
+        match = re.search(
+            r'queryId:"([A-Za-z0-9_-]{20,})",operationName:"TweetDetail"', source
+        )
+        if match is None:
+            log.warning("未能从 bundle 中解析 TweetDetail queryId")
+            return None
+        self._query_id = match.group(1)
+        log.debug("TweetDetail queryId = %s", self._query_id)
+        return self._query_id
 
     # ------------------------------------------------------------------ 视频
 
@@ -172,10 +346,11 @@ class XDownloader:
     async def _ytdlp_items(
         self, link: Link, workdir: Path, title: str | None
     ) -> list[MediaItem]:
-        paths = await asyncio.to_thread(self._run_ytdlp, link.url, workdir)
+        expected = str(link.tweet_id) if link.tweet_id is not None else None
+        paths = await asyncio.to_thread(self._run_ytdlp, link.url, workdir, expected)
         return [MediaItem(path, source_url=link.url, title=title) for path in paths]
 
-    def _run_ytdlp(self, url: str, workdir: Path) -> list[Path]:
+    def _run_ytdlp(self, url: str, workdir: Path, expected_id: str | None = None) -> list[Path]:
         try:
             import yt_dlp
         except ImportError as exc:  # pragma: no cover - 依赖缺失
@@ -217,6 +392,20 @@ class XDownloader:
                 info = ydl.extract_info(url, download=True)
         except Exception as exc:  # yt-dlp 抛出的异常类型很杂
             log.warning("yt-dlp 下载失败 %s：%s", url, exc)
+            return []
+
+        # yt-dlp 的 X extractor 在目标推文不可用时会顺着页面推荐跳到同账号
+        # 另一条推文，静默产出错误的文件。这里校验 id，不一致就丢弃。
+        actual_id = str((info or {}).get("id") or "")
+        if expected_id and actual_id and actual_id != expected_id:
+            log.warning(
+                "yt-dlp 返回了另一条推文（期望 %s，实际 %s），已丢弃：%s",
+                expected_id,
+                actual_id,
+                url,
+            )
+            for path in _collect_paths(info):
+                path.unlink(missing_ok=True)
             return []
 
         paths = _collect_paths(info)
@@ -281,6 +470,24 @@ class _YdlLogger:
 
     def error(self, msg: str) -> None:
         log.error("yt-dlp: %s", msg)
+
+
+def _find_tweet_node(payload: Any, tweet_id: str) -> dict | None:
+    """在 GraphQL 响应里找到指定 id 的推文节点。"""
+    found: list[dict] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("rest_id") == tweet_id and isinstance(node.get("legacy"), dict):
+                found.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(payload)
+    return found[0] if found else None
 
 
 def _mp4_variants(media: dict) -> list[dict]:
